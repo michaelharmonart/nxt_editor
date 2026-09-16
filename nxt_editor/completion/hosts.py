@@ -101,6 +101,7 @@ class MayaHost(HostProvider):
         ('omui', 'maya.api.OpenMayaUI'),
         ('omr', 'maya.api.OpenMayaRender'),
         ('pm', 'pymel.core'),
+        ('yrig', 'yrig')
     )
 
     @classmethod
