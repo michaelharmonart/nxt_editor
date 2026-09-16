@@ -18,6 +18,8 @@ from nxt import DATA_STATE, nxt_path, tokens
 from nxt.nxt_node import INTERNAL_ATTRS
 from nxt_editor.dockwidgets import syntax
 from nxt_editor.constants import FONTS
+from nxt_editor.completion.model import CompletionModel
+from nxt_editor.completion.controller import CompletionController
 import nxt_editor
 
 logger = logging.getLogger(nxt_editor.LOGGER_NAME)
@@ -654,6 +656,13 @@ class NxtCodeEditor(QtWidgets.QPlainTextEdit):
         # Needed to swap the cursor while hovering a token with Ctrl held
         self.viewport().setMouseTracking(True)
 
+        # Code completion (see nxt_editor.completion). The controller owns
+        # the popup and the model; it is driven from keyPressEvent and
+        # eventFilter. The stage model is read live for ${} tokens.
+        self._completion_active = False
+        self.completion = CompletionController(
+            self, CompletionModel(stage_model_getter=self._get_stage_model))
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat("text/plain"):
             event.acceptProposedAction()
@@ -778,6 +787,8 @@ class NxtCodeEditor(QtWidgets.QPlainTextEdit):
         super(NxtCodeEditor, self).focusInEvent(event)
 
     def focusOutEvent(self, event):
+        # Never leave the completion popup orphaned when focus leaves
+        self.completion.dismiss()
         for a, state in self.action_states.items():
             a.setEnabled(state)
         if self.standard_menu:
@@ -819,10 +830,22 @@ class NxtCodeEditor(QtWidgets.QPlainTextEdit):
 
         self.standard_menu.exec_(event.globalPos())
 
+    # Keys the completion popup claims away from the editor Tab/Enter actions
+    _POPUP_KEYS = (QtCore.Qt.Key_Enter, QtCore.Qt.Key_Return,
+                   QtCore.Qt.Key_Tab, QtCore.Qt.Key_Backtab,
+                   QtCore.Qt.Key_Escape, QtCore.Qt.Key_Up, QtCore.Qt.Key_Down,
+                   QtCore.Qt.Key_PageUp, QtCore.Qt.Key_PageDown)
+
     def eventFilter(self, widget, event):
         if not isinstance(event, QtCore.QEvent):
             return False
         if event.type() == QtCore.QEvent.Type.ShortcutOverride:
+            # While the popup is up, claim Tab/Enter/etc as normal key input
+            # so they reach keyPressEvent instead of indent_line/new_line
+            if (self.completion.popup_visible() and
+                    event.key() in self._POPUP_KEYS):
+                event.accept()
+                return True
             return True
         return False
 
@@ -1213,13 +1236,57 @@ class NxtCodeEditor(QtWidgets.QPlainTextEdit):
                                                    self.ce_widget.node_path,
                                                    globally=globally)
 
+    def _get_stage_model(self):
+        """Live stage model for the completion model."""
+        return self.ce_widget.stage_model
+
+    def insert_completion(self, text, prefix):
+        cursor = self.textCursor()
+        for _ in range(len(prefix)):
+            cursor.deletePreviousChar()
+        cursor.insertText(text)
+        self.setTextCursor(cursor)
+
+    def set_completion_active(self, active):
+        if active == self._completion_active:
+            return
+        self._completion_active = active
+        for name in ('indent_line', 'unindent_line', 'new_line'):
+            action = getattr(self.ce_actions, name, None)
+            if action is not None:
+                action.setEnabled(not active)
+
     def keyPressEvent(self, event):
-        plain = not (event.modifiers() & (QtCore.Qt.ControlModifier |
-                                          QtCore.Qt.AltModifier))
-        if plain and not self.isReadOnly() and self.handle_auto_pair(event):
+        if self.completion.handle_key_press(event):
             event.accept()
             return
-        super(NxtCodeEditor, self).keyPressEvent(event)
+
+        ctrl = event.modifiers() & QtCore.Qt.ControlModifier
+        manual = bool(ctrl) and event.key() == QtCore.Qt.Key_Space
+
+        plain = not (event.modifiers() & (
+            QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier))
+        if (plain and not manual and not self.isReadOnly() and
+                self.handle_auto_pair(event)):
+            event.accept()
+            return
+
+        if not manual:
+            super(NxtCodeEditor, self).keyPressEvent(event)
+
+        if self.isReadOnly():
+            return
+
+        if not manual:
+            if event.modifiers() & (
+                    QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier):
+                self.completion.dismiss()
+                return
+            if event.key() in (QtCore.Qt.Key_Shift, QtCore.Qt.Key_Control,
+                               QtCore.Qt.Key_Alt, QtCore.Qt.Key_Meta):
+                return
+
+        self.completion.request(force=manual)
 
     def char_after_cursor(self):
         cursor = self.textCursor()
@@ -1234,116 +1301,113 @@ class NxtCodeEditor(QtWidgets.QPlainTextEdit):
         return text[col - 1] if col > 0 else ''
 
     def handle_auto_pair(self, event):
-        """Insert the matching closer for a bracket/quote, wrap the selection
-        in the pair, or step over a closer that is already there.
-        :param event: QKeyEvent
-        :return: True if the key was handled.
-        """
         text = event.text()
         if not text:
             return False
+
         cursor = self.textCursor()
         closers = set(self.AUTO_PAIRS.values())
-        # Step over an auto-inserted closer instead of doubling it
+
         if (text in closers and not cursor.hasSelection() and
                 self.char_after_cursor() == text):
             cursor.movePosition(QtGui.QTextCursor.Right)
             self.setTextCursor(cursor)
             return True
+
         close = self.AUTO_PAIRS.get(text)
         if close is None:
             return False
-        # Don't pair quotes mid-word (apostrophes, string suffixes)
+
         if text in ("'", '"'):
             if (self.char_before_cursor().isalnum() or
                     self.char_after_cursor().isalnum()):
                 return False
+
         if cursor.hasSelection():
             cursor.insertText(text + cursor.selectedText() + close)
             return True
+
         cursor.insertText(text + close)
         cursor.movePosition(QtGui.QTextCursor.Left)
         self.setTextCursor(cursor)
         return True
 
     def get_token_at(self, pos):
-        """Find the (non-nested) ${...} token under a viewport position.
-        :param pos: QPoint in viewport coordinates
-        :return: tuple of (full_token_str, token_body) or (None, None)
-        """
         cursor = self.cursorForPosition(pos)
         line = cursor.block().text()
         col = cursor.positionInBlock()
+
         for match in re.finditer(r'\$\{[^{}]*\}', line):
             if match.start() <= col <= match.end():
                 full = match.group(0)
                 return full, tokens.get_token_content(full)
+
         return None, None
 
     def node_path_from_token_body(self, body):
-        """Resolve a token body to an absolute node path if it names one.
-        A bare ``${attr}`` (no '.' and no '/') is a local attribute, so it
-        resolves to the current node.
-        :param body: string content of a ${} token
-        :return: node path string or None
-        """
         body = body.strip()
         if not body:
             return None
+
         for token_type in tokens.TOKENTYPE.ALL:
             if token_type.prefix and body.startswith(token_type.prefix):
-                return None  # file:: path:: contents:: are not node refs
+                return None
+
         current = self.ce_widget.node_path
         start = current or nxt_path.WORLD
+
         if '.' in body:
             node_part = body.rpartition('.')[0]
             if not node_part:
-                return current  # '.attr' is the current node
+                return current
             return nxt_path.expand_relative_node_path(node_part, start)
+
         if nxt_path.NODE_SEP in body:
             return nxt_path.expand_relative_node_path(body, start)
+
         return current
 
     def goto_token_definition(self, pos):
-        """Ctrl+click handler: select and frame the node a token references.
-        :param pos: QPoint in viewport coordinates
-        :return: True if a node was selected
-        """
         full, body = self.get_token_at(pos)
         if not full:
             return False
+
         model = self.ce_widget.stage_model
         node_path = self.node_path_from_token_body(body)
+
         if not node_path or model is None:
             return False
         if node_path == self.ce_widget.node_path:
-            return False  # local attr, nowhere to go
+            return False
         if not model.node_exists(node_path):
             logger.warning("Cannot navigate: '{}' not found".format(node_path))
             return False
+
         model.select_and_frame(node_path)
         return True
 
     def show_token_tooltip(self, help_event):
-        """Show the resolved value of the token under the mouse as a tooltip.
-        :param help_event: QHelpEvent
-        :return: True if a tooltip was shown
-        """
         full, _ = self.get_token_at(help_event.pos())
         model = self.ce_widget.stage_model
+
         if not full or model is None:
             QtWidgets.QToolTip.hideText()
             return False
+
         try:
             resolved = model.resolve(self.ce_widget.node_path, full)
         except Exception:
             logger.exception('Token resolve failed for tooltip')
             QtWidgets.QToolTip.hideText()
             return False
+
         if resolved is None:
             resolved = '<unresolved>'
-        QtWidgets.QToolTip.showText(help_event.globalPos(),
-                                    '{}  ->  {}'.format(full, resolved), self)
+
+        QtWidgets.QToolTip.showText(
+            help_event.globalPos(),
+            '{}  ->  {}'.format(full, resolved),
+            self)
         return True
 
     def event(self, event):
@@ -1354,17 +1418,22 @@ class NxtCodeEditor(QtWidgets.QPlainTextEdit):
 
     def mousePressEvent(self, event):
         if (event.modifiers() & QtCore.Qt.ControlModifier and
-                event.button() == QtCore.Qt.LeftButton):
-            if self.goto_token_definition(event.pos()):
-                event.accept()
-                return
+                event.button() == QtCore.Qt.LeftButton and
+                self.goto_token_definition(event.pos())):
+            event.accept()
+            return
+
+        self.completion.dismiss()
         super(NxtCodeEditor, self).mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        over_token = False
-        if event.modifiers() & QtCore.Qt.ControlModifier:
-            over_token = bool(self.get_token_at(event.pos())[0])
-        cursor = QtCore.Qt.PointingHandCursor if over_token else QtCore.Qt.IBeamCursor
+        over_token = (
+            bool(self.get_token_at(event.pos())[0])
+            if event.modifiers() & QtCore.Qt.ControlModifier
+            else False
+        )
+        cursor = (QtCore.Qt.PointingHandCursor if over_token
+                  else QtCore.Qt.IBeamCursor)
         self.viewport().setCursor(cursor)
         super(NxtCodeEditor, self).mouseMoveEvent(event)
 
